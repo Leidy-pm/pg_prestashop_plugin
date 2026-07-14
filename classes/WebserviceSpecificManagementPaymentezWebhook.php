@@ -6,6 +6,7 @@ class WebserviceSpecificManagementPaymentezWebhook implements WebserviceSpecific
     /** @var WebserviceOutputBuilder */
     protected $objOutput;
     protected $output;
+    protected $urlSegment;
 
     /** @var WebserviceRequest */
     protected $wsObject;
@@ -66,20 +67,37 @@ class WebserviceSpecificManagementPaymentezWebhook implements WebserviceSpecific
     {
         $this->wsObject->setOutputEnabled(true);
 
-        $requestBody      = file_get_contents('php://input');
-        $requestBodyJs    = json_decode($requestBody, true);
-        $transaction_id   = $requestBodyJs["transaction"]['id'];
-        $status_detail    = $requestBodyJs["transaction"]['status_detail'] ?? 999;
-        $dev_reference    = $requestBodyJs["transaction"]['dev_reference'];
-        $pg_stoken        = $requestBodyJs["transaction"]['stoken'];
-        $application_code = $requestBodyJs["transaction"]['application_code'];
+        $requestBody   = file_get_contents('php://input');
+        $requestBodyJs = json_decode($requestBody, true);
+        $transaction   = $requestBodyJs['transaction'] ?? null;
+
+        if (!is_array($transaction)) {
+            throw new WebserviceException('Invalid payload', [1, 400]);
+        }
+
+        $transaction_id   = $transaction['id'] ?? null;
+        $status_detail    = $transaction['status_detail'] ?? 999;
+        $dev_reference    = $transaction['dev_reference'] ?? null;
+        $pg_stoken        = $transaction['stoken'] ?? null;
+        $application_code = $transaction['application_code'] ?? null;
+
+        if (!$transaction_id || !$dev_reference || !$pg_stoken || !$application_code) {
+            throw new WebserviceException('Missing required fields', [1, 400]);
+        }
 
         $orderId = Order::getIdByCartId($dev_reference);
-        if (!$orderId)
-        {
+        if (!$orderId) {
             throw new WebserviceException('Order not found', [1, 400]);
         }
         $order = new Order($orderId);
+
+        if ((int)$status_detail === 3) {
+            $transaction_amount = (float)($transaction['amount'] ?? 0);
+            if ($transaction_amount <= 0 || abs($transaction_amount - (float)$order->total_paid) > 0.01) {
+                throw new WebserviceException('Amount mismatch', [1, 400]);
+            }
+        }
+
         $this->update_order_status($application_code, $order, $transaction_id, $pg_stoken, $status_detail);
     }
 
@@ -89,13 +107,17 @@ class WebserviceSpecificManagementPaymentezWebhook implements WebserviceSpecific
      */
     private function update_order_status($application_code, $order, $transaction_id, $pg_stoken, $status_detail)
     {
-        $codes_keys = [
-            Configuration::get('app_code_client') => Configuration::get('app_key_client'),
-            Configuration::get('app_code_server') => Configuration::get('app_key_server'),
-        ];
-        // TODO: Meter todo esto en una funcion validateStoken()
-        $app_code = $application_code;
-        $app_key = $codes_keys[$app_code];
+        $app_code = (string) Configuration::get('app_code_server');
+        $app_key  = (string) Configuration::get('app_key_server');
+
+        if ($app_code === '' || $app_key === '') {
+            throw new WebserviceException('Webhook credentials not configured', [1, 500]);
+        }
+
+        if ($application_code !== $app_code) {
+            throw new WebserviceException('Application code invalid', [1, 401]);
+        }
+
         $user_id = $order->id_customer;
         $for_md5 = "{$transaction_id}_{$app_code}_{$user_id}_{$app_key}";
         $stoken = md5($for_md5);
@@ -125,11 +147,17 @@ class WebserviceSpecificManagementPaymentezWebhook implements WebserviceSpecific
     private function map_status($status_detail): int
     {
         $pg_status_ps = [
-            0 => 10, // “Awaiting”
-            3 => 2, // “Payment accepted”
-            7 => 7, // “Refunded”
-            8 => 13, // “Awaiting Cash On Delivery validation” (chargeback)
+            0 => $this->getOrderStateId('PS_OS_PREPARATION', 10), // Awaiting / pending
+            3 => $this->getOrderStateId('PS_OS_PAYMENT', 2), // Payment accepted
+            7 => $this->getOrderStateId('PS_OS_REFUND', 7), // Refunded
+            8 => $this->getOrderStateId('PS_OS_ERROR', 8), // Chargeback / error
         ];
         return $pg_status_ps[$status_detail] ?? 8; // 8 => "Payment Error"
+    }
+
+    private function getOrderStateId(string $configKey, int $fallback): int
+    {
+        $stateId = (int) Configuration::get($configKey);
+        return $stateId > 0 ? $stateId : $fallback;
     }
 }

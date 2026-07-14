@@ -1,8 +1,7 @@
-<link rel="stylesheet" href="{$urls.base_url}/modules/pg_prestashop_plugin/views/css/main.css">
 <section>
       <div class="col">
           <div class="payment-checkout">
-              <img src="{$urls.base_url}/modules/pg_prestashop_plugin/imgs/payment-logo.svg" alt="Payment method"
+              <img src="https://cdn.paymentez.com/img/paymentez_nuvei.png" alt="Payment method"
                   class="payment-checkout-img">
               <p class="payment-checkout-description">
               <span>
@@ -12,4 +11,3 @@
           </div>
       </div>
 </section>
-

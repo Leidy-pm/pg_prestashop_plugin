@@ -5,13 +5,11 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
     public function init()
     {
         parent::init();
-        if(!$this->module->active)
-        {
+        if (!$this->module->active) {
             Tools::redirect($this->context->link->getPageLink('order'));
         }
         $customer = $this->context->customer;
-        if(!Validate::isLoadedObject($customer))
-        {
+        if (!Validate::isLoadedObject($customer)) {
             Tools::redirect($this->context->link->getPageLink('order'));
         }
     }
@@ -24,59 +22,32 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
     {
         parent::initContent();
 
-        $cart = $this->context->cart;
+        $cart     = $this->context->cart;
         $customer = $this->context->customer;
-        $billing_address = new Address($cart->id_address_invoice);
+
+        $billing_address          = new Address($cart->id_address_invoice);
         $address_delivery_country = new Country($billing_address->id_country);
-        $iso_code = PG_Prestashop_Utils::get_convert_country($address_delivery_country->iso_code);
-        $address_delivery_state = new State($billing_address->id_state);
-        $iso_code_state = PG_Prestashop_Utils::validate_state($address_delivery_state->iso_code);
-        $total = (float)$cart->getOrderTotal();
+        $iso_code                 = PG_Prestashop_Utils::get_convert_country($address_delivery_country->iso_code);
+        $address_delivery_state   = new State($billing_address->id_state);
+        $iso_code_state           = PG_Prestashop_Utils::validate_state($address_delivery_state->iso_code);
+
         $products = $cart->getProducts();
-        $order_products = [];
-        foreach ($products as $product)
-            $order_products[] = $product['cart_quantity']." X ".$product['name'];
-        $order_description = implode(", ", $order_products);
-        if (strlen($order_description) > 240)
-        {
-            $order_description = substr($order_description,0,240);
-        }
+
         $checkout_language = $this->mapCheckoutLanguage(Configuration::get('checkout_language'));
         $environment       = $this->mapEnvironment(Configuration::get('environment'));
+        $pg_sig            = PG_Prestashop_Utils::buildFrontSecuritySignature($cart, $customer);
 
         $this->context->smarty->assign([
-            'app_code_client'      => Configuration::get('app_code_client'),
-            'app_key_client'       => Configuration::get('app_key_client'),
-            'app_code_server'      => Configuration::get('app_code_server'),
-            'app_key_server'       => Configuration::get('app_key_server'),
-            'checkout_language'    => $checkout_language,
-            'environment'          => $environment,
-            'ltp_url'              => $this->mapLinkToPayUrl($environment),
-            'user_id'              => $cart->id_customer,
-            'user_email'           => $customer->email,
-            'order_description'    => $order_description,
-            'order_amount'         => $total,
-            'order_vat'            => 0.0,
-            'order_reference'      => $cart->id,
-            'products'             => $products,
-            'user_firstname'       => $customer->firstname,
-            'user_lastname'        => $customer->lastname,
-            'currency'             => Currency::getIsoCodeById($cart->id_currency),
-            'expiration_days'      => Configuration::get('ltp_expiration_days'),
-            'order_url'            => Context::getContext()->shop->getBaseURL(true).'index.php?controller=order-confirmation&id_cart='.(int)$cart->id.'&id_module='.(int)$this->module->id.'&id_order='.$this->module->currentOrder.'&key='.$customer->secure_key,
-            'ltp_button_text'      => Configuration::get('ltp_button_text'),
-            'card_button_text'     => Configuration::get('card_button_text'),
-            'enable_installments'  => Configuration::get('enable_installments'),
-            'installments_options' => $this->getInstallmentsOptions(),
-            'enable_card'          => Configuration::get('enable_card'),
-            'enable_ltp'           => Configuration::get('enable_ltp'),
-            'billing_address'  => [
-                'street'               => $billing_address->address1,
-                'city'                 => $billing_address->city,
-                'country'              => $iso_code,
-                'state'                => $iso_code_state,
-                'zip'                  => $billing_address->postcode
-            ]
+            'checkout_language' => $checkout_language,
+            'environment'       => $environment,
+            'card_init_url'     => $this->context->link->getModuleLink($this->module->name, 'payment', ['action' => 'initCardReference', 'pg_sig' => $pg_sig]),
+            'ltp_init_url'      => $this->context->link->getModuleLink($this->module->name, 'ltp', ['pg_sig' => $pg_sig]),
+            'pg_sig'            => $pg_sig,
+            'products'          => $products,
+            'card_button_text'  => Configuration::get('card_button_text'),
+            'ltp_button_text'   => Configuration::get('ltp_button_text'),
+            'enable_card'       => Configuration::get('enable_card'),
+            'enable_ltp'        => Configuration::get('enable_ltp'),
         ]);
 
         $this->setTemplate('module:pg_prestashop_plugin/views/templates/front/payment.tpl');
@@ -85,71 +56,257 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
     public function setMedia()
     {
         parent::setMedia();
+        $this->registerJavascript(
+            'jquery',
+            'https://code.jquery.com/jquery-3.6.0.min.js',
+            ['server' => 'remote', 'position' => 'head', 'priority' => 5]
+        );
     }
 
     public function postProcess()
     {
-        if (!empty($_POST))
-        {
-            $cart           = $this->context->cart;
-            $customer       = new Customer($cart->id_customer);
+        $action = Tools::getValue('action');
 
-            $total          = (float)Tools::getValue('amount');
-            $payment_id     = Tools::getValue('id');
-            $status         = Tools::getValue('status');
-            $payment_method = Tools::getValue('payment_method');
+        if ($action === 'initCardReference') {
+            $cart = $this->context->cart;
+            $customer = $this->context->customer;
+            if (!Validate::isLoadedObject($cart) || !Validate::isLoadedObject($customer) || !$this->isValidFrontSignature($cart, $customer)) {
+                $this->returnJson(['success' => false, 'error' => 'Invalid request signature']);
+            }
+            $this->initCardReference();
+        }
 
-            if ($payment_method == 'LinkToPay')
-            {
-                $this->module->validateOrder($cart->id, Configuration::get('PS_OS_BANKWIRE'), $total, $this->module->displayName, null, array(), $this->context->currency->id, false, $customer->secure_key);
+        if (empty($_POST)) {
+            return;
+        }
 
-                $this->assignPaymentId($payment_id);
-
-                $payment_url    = Tools::getValue('payment_url');
-                $this->context->smarty->assign([
-                    'pg_status'      => 'pending',
-                    'payment_id'     => Tools::getValue('id'),
-                    'module_gtw'     => $this->module->displayName,
-                    'payment_method' => $payment_method,
-                    'payment_url'    => $payment_url
-                ]);
-                Tools::redirect($payment_url);
+        try {
+            $cart     = $this->context->cart;
+            if (!Validate::isLoadedObject($cart)) {
+                throw new Exception('Invalid cart');
             }
 
-            if ($status == 'success')
-            {
-                $this->module->validateOrder($cart->id, Configuration::get('PS_OS_PAYMENT'), $total, $this->module->displayName, null, array(), $this->context->currency->id, false, $customer->secure_key);
+            $customer = new Customer($cart->id_customer);
+            if (!Validate::isLoadedObject($customer)) {
+                throw new Exception('Invalid customer');
             }
-            elseif ($status == 'pending')
-            {
-                $this->module->validateOrder($cart->id, Configuration::get('PS_OS_PREPARATION'), $total, $this->module->displayName, null, array(), $this->context->currency->id, false, $customer->secure_key);
+
+            if (!$this->isValidFrontSignature($cart, $customer)) {
+                throw new Exception('Invalid request signature');
             }
-            else
-            {
-                $this->module->validateOrder($cart->id, Configuration::get('PS_OS_ERROR'), $total, $this->module->displayName, null, array(), $this->context->currency->id, false, $customer->secure_key);
+
+            $amountTaxData = PG_Prestashop_Utils::getCartAmountAndVat($cart);
+            $total        = (float) $amountTaxData['total'];
+            $payment_id   = Tools::getValue('id');
+            $status_detail = (int)Tools::getValue('status_detail');
+
+            if (!$payment_id) {
+                throw new Exception('Missing payment id');
             }
+
+            $this->module->validateOrder(
+                $cart->id,
+                Configuration::get('PS_OS_PREPARATION'),
+                $total,
+                $this->module->displayName,
+                null,
+                [],
+                $this->context->currency->id,
+                false,
+                $customer->secure_key
+            );
+
+            if (!$this->module->currentOrder) {
+                throw new Exception('Order creation failed');
+            }
+
+            $this->context->cookie->pg_payment_approved = ($status_detail === 3) ? '1' : '0';
 
             $this->assignPaymentId($payment_id);
+            PG_Prestashop_Utils::markOrderPaymentFlow(new Order((int) $this->module->currentOrder), 'card');
 
-            $this->context->smarty->assign([
-                'pg_status'      => $status,
-                'payment_id'     => $payment_id,
-                'module_gtw'     => $this->module->displayName,
-                'payment_method' => $payment_method
-            ]);
-            Tools::redirect('index.php?controller=order-confirmation&id_cart='.(int)$cart->id.'&id_module='.(int)$this->module->id.'&id_order='.$this->module->currentOrder.'&key='.$customer->secure_key);
+            $confirmUrl = 'index.php?controller=order-confirmation'
+                . '&id_cart=' . (int)$cart->id
+                . '&id_module=' . (int)$this->module->id
+                . '&id_order=' . (int)$this->module->currentOrder
+                . '&key=' . $customer->secure_key;
+
+            Tools::redirect($confirmUrl);
+        } catch (Exception $e) {
+            PrestaShopLogger::addLog('Paymentez payment postProcess error: ' . $e->getMessage(), 3);
+            $this->errors[] = $this->module->l('An error occurred while processing your payment.', 'payment');
+            $this->redirectWithNotifications($this->context->link->getPageLink('order'));
         }
     }
 
-    private function assignPaymentId($payment_id) {
+    private function initCardReference()
+    {
+        try {
+            $cart = $this->context->cart;
+            if (!Validate::isLoadedObject($cart)) {
+                $this->returnJson(['success' => false, 'error' => 'Invalid cart']);
+            }
+
+            $customer = $this->context->customer;
+            if (!Validate::isLoadedObject($customer)) {
+                $this->returnJson(['success' => false, 'error' => 'Not authenticated']);
+            }
+
+            $billing_address          = new Address($cart->id_address_invoice);
+            $address_delivery_country = new Country($billing_address->id_country);
+            $iso_code                 = PG_Prestashop_Utils::get_convert_country($address_delivery_country->iso_code);
+            $address_delivery_state   = new State($billing_address->id_state);
+            $iso_code_state           = PG_Prestashop_Utils::validate_state($address_delivery_state->iso_code);
+
+            $amountTaxData = PG_Prestashop_Utils::getCartAmountAndVat($cart);
+            $total        = (float) $amountTaxData['total'];
+            $vat          = (float) $amountTaxData['vat'];
+            $products     = $cart->getProducts();
+
+            $order_products = [];
+            foreach ($products as $product) {
+                $order_products[] = $product['cart_quantity'] . ' X ' . $product['name'];
+            }
+            $order_description = implode(', ', $order_products);
+            if (strlen($order_description) > 240) {
+                $order_description = substr($order_description, 0, 240);
+            }
+
+            $checkout_language = $this->mapCheckoutLanguage(Configuration::get('checkout_language'));
+            $environment       = $this->mapEnvironment(Configuration::get('environment'));
+            $currency          = Currency::getIsoCodeById($cart->id_currency);
+
+            $billing = [
+                'street'  => $billing_address->address1,
+                'city'    => $billing_address->city,
+                'country' => $iso_code,
+                'state'   => $iso_code_state,
+                'zip'     => $billing_address->postcode,
+            ];
+
+            $reference = $this->callInitReference(
+                $environment,
+                (string)$cart->id_customer,
+                $customer->email,
+                $total,
+                $order_description,
+                (string)$cart->id,
+                $vat,
+                $currency,
+                $checkout_language,
+                $billing
+            );
+
+            if (empty($reference)) {
+                $this->returnJson(['success' => false, 'error' => 'Failed to get reference from gateway']);
+            }
+
+            $this->returnJson(['success' => true, 'reference' => $reference]);
+        } catch (Exception $e) {
+            PrestaShopLogger::addLog('Paymentez initCardReference error: ' . $e->getMessage(), 3);
+            $this->returnJson(['success' => false, 'error' => 'An error occurred']);
+        }
+    }
+
+    private function returnJson(array $data): void
+    {
+        header('Content-Type: application/json');
+        echo json_encode($data);
+        exit;
+    }
+
+    private function callInitReference(
+        string $environment,
+        string $user_id,
+        string $user_email,
+        float $amount,
+        string $description,
+        string $dev_reference,
+        float $vat,
+        string $currency,
+        string $locale,
+        array $billing_address
+    ): string {
+        $app_code_server = Configuration::get('app_code_server');
+        $app_key_server  = Configuration::get('app_key_server');
+
+        $timestamp       = (string)time();
+        $uniq_token_hash = hash('sha256', $app_key_server . $timestamp);
+        $auth_token      = base64_encode($app_code_server . ';' . $timestamp . ';' . $uniq_token_hash);
+
+        $base_url = ($environment === 'stg')
+            ? 'https://ccapi-stg.' . FLAVOR_DOMAIN
+            : 'https://ccapi.' . FLAVOR_DOMAIN;
+
+        $order_data = [
+            'dev_reference' => $dev_reference,
+            'description'   => $description,
+            'amount'        => $amount,
+            'currency'      => $currency,
+            'vat'      => 0,
+        ];
+
+        if ($vat > 0) {
+            $taxable_amount = round($amount - $vat, 2);
+            $order_data['vat']            = $vat;
+            $order_data['taxable_amount'] = $taxable_amount;
+            $order_data['tax_percentage'] = ($taxable_amount > 0)
+                ? round(($vat / $taxable_amount) * 100, 2)
+                : 0.0;
+        }
+
+        $installments_type = (int)Configuration::get('installments_type');
+        if ($installments_type !== -1) {
+            $order_data['installments_type'] = $installments_type;
+        }
+
+        $payload = json_encode([
+            'locale'          => $locale,
+            'user'            => ['id' => $user_id, 'email' => $user_email],
+            'order'           => $order_data,
+            'billing_address' => $billing_address,
+        ]);
+
+        $ch = curl_init($base_url . '/v2/transaction/init_reference/');
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Auth-Token: ' . $auth_token,
+        ]);
+        $response = curl_exec($ch);
+        $curl_error = curl_error($ch);
+        $http_code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($response === false || $curl_error !== '') {
+            PrestaShopLogger::addLog(
+                'Paymentez init_reference cURL error: ' . $curl_error,
+                3
+            );
+            return '';
+        }
+
+        $data = json_decode($response, true);
+        if (!is_array($data) || empty($data['reference'])) {
+            PrestaShopLogger::addLog(
+                'Paymentez init_reference failed. HTTP ' . $http_code . ' Response: ' . $response,
+                3
+            );
+        }
+        return $data['reference'] ?? '';
+    }
+
+    private function assignPaymentId(string $payment_id): void
+    {
         $order      = new Order($this->module->currentOrder);
         $collection = OrderPayment::getByOrderReference($order->reference);
-        if (count($collection) > 0)
-        {
-            foreach ($collection as $order_payment)
-            {
-                if ($order_payment->payment_method == FLAVOR . ' Prestashop Plugin')
-                {
+        if (count($collection) > 0) {
+            foreach ($collection as $order_payment) {
+                if ($order_payment->payment_method == FLAVOR . ' Prestashop Plugin') {
                     $order_payment->transaction_id = $payment_id;
                     $order_payment->update();
                 }
@@ -157,47 +314,21 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
         }
     }
 
-    private function mapCheckoutLanguage($checkout_language): string
+    private function mapCheckoutLanguage(string $checkout_language): string
     {
-        return  [1 => 'en', 2 => 'es', 3 => 'pt',][$checkout_language];
+        return [1 => 'en', 2 => 'es', 3 => 'pt'][$checkout_language] ?? 'en';
     }
 
-    private function mapEnvironment($environment): string
+    private function mapEnvironment(string $environment): string
     {
-        return [1 => 'stg', 2 => 'prod',][$environment];
+        return [1 => 'stg', 2 => 'prod'][$environment] ?? 'stg';
     }
 
-    private function mapLinkToPayUrl($environment): string
+    private function isValidFrontSignature(Cart $cart, Customer $customer): bool
     {
-        return [
-            'stg' => 'https://noccapi-stg.'.FLAVOR_DOMAIN.'/linktopay/init_order/',
-            'prod' => 'https://noccapi.'.FLAVOR_DOMAIN.'/linktopay/init_order/'
-        ][$environment];
+        $signature = (string) Tools::getValue('pg_sig');
+        return PG_Prestashop_Utils::isValidFrontSecuritySignature($signature, $cart, $customer);
     }
 
-    private function getInstallmentsOptions(): array
-    {
-        return [
-            1  => $this->module->l('Revolving and deferred without interest (The bank will pay to the commerce the installment, month by month)(Ecuador)', 'payment'),
-            2  => $this->module->l('Deferred with interest (Ecuador, México)', 'payment'),
-            3  => $this->module->l('Deferred without interest (Ecuador, México)', 'payment'),
-            7  => $this->module->l('Deferred with interest and months of grace (Ecuador)', 'payment'),
-            6  => $this->module->l('Deferred without interest pay month by month (Ecuador)(Medianet)', 'payment'),
-            9  => $this->module->l('Deferred without interest and months of grace (Ecuador, México)', 'payment'),
-            10 => $this->module->l('Deferred without interest promotion bimonthly (Ecuador)(Medianet)', 'payment'),
-            21 => $this->module->l('For Diners Club exclusive, deferred with and without interest (Ecuador)', 'payment'),
-            22 => $this->module->l('For Diners Club exclusive, deferred with and without interest (Ecuador)', 'payment'),
-            30 => $this->module->l('Deferred with interest pay month by month (Ecuador)(Medianet)', 'payment'),
-            50 => $this->module->l('Deferred without interest promotions (Supermaxi)(Ecuador)(Medianet)', 'payment'),
-            51 => $this->module->l('Deferred with interest (Cuota fácil)(Ecuador)(Medianet)', 'payment'),
-            52 => $this->module->l('Without interest (Rendecion Produmillas)(Ecuador)(Medianet)', 'payment'),
-            53 => $this->module->l('Without interest sale with promotions (Ecuador)(Medianet)', 'payment'),
-            70 => $this->module->l('Deferred special without interest (Ecuador)(Medianet)', 'payment'),
-            72 => $this->module->l('Credit without interest (cte smax)(Ecuador)(Medianet)', 'payment'),
-            73 => $this->module->l('Special credit without interest (smax)(Ecuador)(Medianet)', 'payment'),
-            74 => $this->module->l('Prepay without interest (smax)(Ecuador)(Medianet)', 'payment'),
-            75 => $this->module->l('Defered credit without interest (smax)(Ecuador)(Medianet)', 'payment'),
-            90 => $this->module->l('Without interest with months of grace (Supermaxi)(Ecuador)(Medianet)', 'payment'),
-        ];
-    }
+
 }
