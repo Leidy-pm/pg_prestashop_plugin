@@ -35,7 +35,11 @@ You can download the current stable release from: https://github.com/paymentez/p
 ### 4.1. Refunds
 - The plugin supports **Partial Refunds** and **Standard Refunds** only for **card payments**. LinkToPay does not support refunds.
 - The **Standard Refund** now uses the full paid order amount when **Credit slip** is selected in PrestaShop. Partial refunds still use the selected products and shipping amount. A success refund operation depends on the configured payment network accepting refunds.
-### 4.2. Webhook
+### 4.2. Security and flow updates
+- Front payment endpoints include request signature validation (`pg_sig`) to protect card and LinkToPay initialization calls.
+- Card flow validates the external payment amount against the cart total before creating the order.
+- Historical orders without explicit flow marker remain refundable as a backward-compatibility fallback.
+### 4.3. Webhook
 The Paymentez Prestashop plugin has an internal webhook in order to keep updated the transactions statuses between Prestashop and Paymentez. You need to follow the next steps to configure the webhook:
   1. Login into the Prestashop Back-office.
   2. Navigate to Advance Parameters -> Web Services menu options to open the Web Services page.

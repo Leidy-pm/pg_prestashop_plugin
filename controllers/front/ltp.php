@@ -40,13 +40,11 @@ class PG_Prestashop_PluginLtpModuleFrontController extends ModuleFrontController
         $vat          = (float) $amountTaxData['vat'];
         $currency     = Currency::getIsoCodeById($cart->id_currency);
         $environment  = $this->mapEnvironment(Configuration::get('environment'));
-        $phone        = $this->getCustomerPhone($cart);
-        if ($phone === '') {
-            $this->returnJson(['success' => false, 'error' => 'Invalid customer phone format']);
-        }
+        $phone        = $this->getCustomerPhone($cart); // empty string if unavailable — omitted from payload
         $billing      = $this->getBillingAddress($cart, $customer);
 
-        // Create the PS order before calling LTP so we have the order ID for the confirmation URL
+        // Create the PS order first — LTP is asynchronous; the order must exist before the user is
+        // redirected to the gateway so the webhook can update its state later.
         $this->module->validateOrder(
             $cart->id,
             Configuration::get('PS_OS_BANKWIRE'),
@@ -59,17 +57,15 @@ class PG_Prestashop_PluginLtpModuleFrontController extends ModuleFrontController
             $customer->secure_key
         );
 
-        $order_id  = (int)$this->module->currentOrder;
-        $order_url = $this->context->link->getPageLink(
-            'order-confirmation',
-            true,
-            null,
-            [
-                'id_cart' => (int) $cart->id,
-                'id_module' => (int) $this->module->id,
-                'id_order' => $order_id,
-                'key' => $customer->secure_key,
-            ]
+        $order_id = (int)$this->module->currentOrder;
+
+        // All gateway return URLs go through ltpreturn, which resolves the order by cart ID
+        // and redirects to order-confirmation regardless of payment outcome.
+        $return_url = $this->context->link->getModuleLink(
+            $this->module->name,
+            'ltpreturn',
+            ['id_cart' => (int)$cart->id, 'key' => $customer->secure_key],
+            true
         );
 
         $ltp_response = $this->callLtpInitOrder(
@@ -86,10 +82,12 @@ class PG_Prestashop_PluginLtpModuleFrontController extends ModuleFrontController
             $currency,
             $billing,
             (int)Configuration::get('ltp_expiration_days'),
-            $order_url
+            $return_url,
+            $return_url
         );
 
         if (empty($ltp_response['success'])) {
+            // LTP API failed after order creation — mark the order as error so it is visible in BO.
             $history           = new OrderHistory();
             $history->id_order = $order_id;
             $history->changeIdOrderState((int)Configuration::get('PS_OS_ERROR'), $order_id);
@@ -127,7 +125,8 @@ class PG_Prestashop_PluginLtpModuleFrontController extends ModuleFrontController
         string $currency,
         array $billing_address,
         int $expiration_days,
-        string $order_url
+        string $success_url,
+        string $failure_url
     ): array {
         $app_code_server = Configuration::get('app_code_server');
         $app_key_server  = Configuration::get('app_key_server');
@@ -157,24 +156,28 @@ class PG_Prestashop_PluginLtpModuleFrontController extends ModuleFrontController
                 : 0.0;
         }
 
+        $user_data = [
+            'id'        => $user_id,
+            'email'     => $user_email,
+            'name'      => $user_name,
+            'last_name' => $user_last_name,
+        ];
+        if ($user_phone !== '') {
+            $user_data['phone'] = $user_phone;
+        }
+
         $payload = json_encode([
-            'user'  => [
-                'id'        => $user_id,
-                'email'     => $user_email,
-                'name'      => $user_name,
-                'last_name' => $user_last_name,
-                'phone'     => $user_phone,
-            ],
+            'user'  => $user_data,
             'order' => $order_data,
             'billing_address'   => $billing_address,
             'configuration' => [
                 'partial_payment'         => false,
                 'expiration_days'         => $expiration_days,
                 'allowed_payment_methods' => ['All'],
-                'success_url'             => $order_url,
-                'failure_url'             => $order_url,
-                'pending_url'             => $order_url,
-                'review_url'              => $order_url,
+                'success_url'             => $success_url,
+                'failure_url'             => $failure_url,
+                'pending_url'             => $success_url,
+                'review_url'              => $success_url,
             ],
         ]);
 

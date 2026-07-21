@@ -46,6 +46,7 @@ class PG_Prestashop_Plugin extends PaymentModule
     {
         return parent::install()
             && $this->registerHook('header')
+            && $this->registerHook('paymentReturn')
             && $this->registerHook('displayPaymentReturn')
             && $this->registerHook('actionProductCancel')
             && $this->registerHook('actionOrderSlipAdd')
@@ -417,9 +418,9 @@ class PG_Prestashop_Plugin extends PaymentModule
         }
 
         $newOption = new PaymentOption();
-        $newOption->setModuleName($this->displayName)
+        $newOption->setModuleName($this->name)
                   ->setCallToActionText($this->displayName)
-                  ->setAction($this->context->link->getModuleLink($this->name, 'payment', $actionParams))
+                  ->setAction($this->context->link->getModuleLink($this->name, 'payment', $actionParams, true))
                   ->setAdditionalInformation($this->context->smarty->fetch('module:pg_prestashop_plugin/views/templates/front/payment_infos.tpl'));
 
         return [$newOption];
@@ -437,7 +438,21 @@ class PG_Prestashop_Plugin extends PaymentModule
 
     private function processRefundRequest(array $params): void
     {
-        if ((int)($params['action'] ?? 1) !== 1 && empty($_POST['cancel_product'])) {
+        $hasLegacyCancelProduct = !empty($_POST['cancel_product']);
+        $hasOrderSlipData = isset($params['orderSlipCreated'])
+            || isset($params['productList'])
+            || isset($params['order_slip']);
+        $isPerProductCall = isset($params['id_order_detail'])
+            || isset($params['cancel_amount'])
+            || isset($params['cancel_quantity']);
+
+        if ($isPerProductCall && !$hasLegacyCancelProduct && !$hasOrderSlipData) {
+            return;
+        }
+
+        if (!$hasLegacyCancelProduct
+            && !$hasOrderSlipData
+            && (int)($params['action'] ?? 1) !== 1) {
             return;
         }
 
@@ -505,30 +520,17 @@ class PG_Prestashop_Plugin extends PaymentModule
             return $this->calculateRefundAmount($cancel_product, $order);
         }
 
-        foreach ([
-            'amount_to_refund',
-            'refund_amount',
-            'amount',
-            'total',
-        ] as $key) {
-            if (isset($params[$key]) && is_numeric($params[$key])) {
-                return (float) $params[$key];
+        if (isset($params['orderSlipCreated']) && $params['orderSlipCreated'] instanceof OrderSlip) {
+            $amount = $this->extractAmountFromOrderSlip($params['orderSlipCreated']);
+            if ($amount > 0) {
+                return $amount;
             }
         }
 
-        if (isset($params['order_slip']) && is_object($params['order_slip'])) {
-            foreach (['amount', 'total', 'refund_amount'] as $property) {
-                if (isset($params['order_slip']->{$property}) && is_numeric($params['order_slip']->{$property})) {
-                    return (float) $params['order_slip']->{$property};
-                }
-            }
-        }
-
-        if (isset($params['order_slip']) && is_array($params['order_slip'])) {
-            foreach (['amount', 'total', 'refund_amount'] as $property) {
-                if (isset($params['order_slip'][$property]) && is_numeric($params['order_slip'][$property])) {
-                    return (float) $params['order_slip'][$property];
-                }
+        if (isset($params['order_slip']) && $params['order_slip'] instanceof OrderSlip) {
+            $amount = $this->extractAmountFromOrderSlip($params['order_slip']);
+            if ($amount > 0) {
+                return $amount;
             }
         }
 
@@ -539,37 +541,68 @@ class PG_Prestashop_Plugin extends PaymentModule
                     continue;
                 }
 
-                $unitPrice = (float) ($product['unit_price_tax_incl'] ?? $product['price'] ?? $product['price_wt'] ?? 0);
-                $quantity = (float) ($product['refund_quantity'] ?? $product['quantity'] ?? 1);
+                if (isset($product['amount']) && is_numeric($product['amount'])) {
+                    $amount += (float) $product['amount'];
+                    continue;
+                }
+
+                if (isset($product['total_refunded_tax_incl']) && is_numeric($product['total_refunded_tax_incl'])) {
+                    $amount += (float) $product['total_refunded_tax_incl'];
+                    continue;
+                }
+
+                $unitPrice = (float) ($product['unit_price_tax_incl'] ?? $product['price_wt'] ?? $product['price'] ?? 0);
+                $quantity = (float) ($product['quantity'] ?? $product['refund_quantity'] ?? 0);
                 $amount += $unitPrice * $quantity;
             }
 
             if ($amount > 0) {
-                return $amount;
+                return round($amount, 2);
             }
         }
 
-        if (!empty($params['qtyList']) && is_array($params['qtyList']) && !empty($params['productList']) && is_array($params['productList'])) {
-            $amount = 0.0;
-            foreach ($params['qtyList'] as $idOrderDetail => $quantity) {
-                foreach ($params['productList'] as $product) {
-                    $productId = $product['id_order_detail'] ?? $product['id'] ?? null;
-                    if ((string) $productId !== (string) $idOrderDetail) {
-                        continue;
-                    }
-
-                    $unitPrice = (float) ($product['unit_price_tax_incl'] ?? $product['price'] ?? $product['price_wt'] ?? 0);
-                    $amount += $unitPrice * (float) $quantity;
-                    break;
-                }
+        foreach (['amount_to_refund', 'refund_amount', 'cancel_amount', 'amount', 'total'] as $key) {
+            if (isset($params[$key]) && is_numeric($params[$key])) {
+                return (float) $params[$key];
             }
+        }
 
+        $latestSlip = $this->loadLatestOrderSlip($order);
+        if ($latestSlip instanceof OrderSlip) {
+            $amount = $this->extractAmountFromOrderSlip($latestSlip);
             if ($amount > 0) {
                 return $amount;
             }
         }
 
         return 0.0;
+    }
+
+    private function extractAmountFromOrderSlip(OrderSlip $slip): float
+    {
+        $amount = (float) $slip->amount + (float) $slip->shipping_cost_amount;
+        if ($amount > 0) {
+            return round($amount, 2);
+        }
+
+        $amount = (float) $slip->total_products_tax_incl + (float) $slip->total_shipping_tax_incl;
+        return $amount > 0 ? round($amount, 2) : 0.0;
+    }
+
+    private function loadLatestOrderSlip(Order $order): ?OrderSlip
+    {
+        $id = (int) Db::getInstance()->getValue(
+            'SELECT id_order_slip FROM `' . _DB_PREFIX_ . 'order_slip`
+             WHERE id_order = ' . (int) $order->id . '
+             ORDER BY id_order_slip DESC'
+        );
+
+        if ($id <= 0) {
+            return null;
+        }
+
+        $slip = new OrderSlip($id);
+        return Validate::isLoadedObject($slip) ? $slip : null;
     }
 
     private function sendRefundToPaymentez(string $transaction_id, float $amount_to_refund): ?array
@@ -743,6 +776,11 @@ class PG_Prestashop_Plugin extends PaymentModule
             'pg_payment_approved' => $pg_approved,
         ]);
         return $this->display(__FILE__, 'views/templates/hook/payment_return.tpl');
+    }
+
+    public function hookPaymentReturn($params): string
+    {
+        return $this->hookDisplayPaymentReturn($params);
     }
 
     public function hookAddWebserviceResources(): array

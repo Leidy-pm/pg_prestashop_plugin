@@ -300,11 +300,14 @@ class PG_Prestashop_Utils
 
     public static function isCardRefundableOrder(Order $order): bool
     {
+        $hasLegacyModulePayment = false;
         $collection = OrderPayment::getByOrderReference($order->reference);
         foreach ($collection as $order_payment) {
             if ($order_payment->payment_method != FLAVOR . ' Prestashop Plugin' && $order_payment->payment_method) {
                 continue;
             }
+
+            $hasLegacyModulePayment = true;
 
             if ($order_payment->card_brand === self::paymentFlowMarker(self::PAYMENT_FLOW_CARD)) {
                 return true;
@@ -313,6 +316,10 @@ class PG_Prestashop_Utils
             if ($order_payment->card_brand === self::paymentFlowMarker(self::PAYMENT_FLOW_LTP)) {
                 return false;
             }
+        }
+
+        if ($hasLegacyModulePayment) {
+            return true;
         }
 
         return false;

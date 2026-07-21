@@ -77,6 +77,8 @@
        jQuery(document).ready(function ($) {
            $('.ltp-button').on('click', function (e) {
                e.preventDefault();
+               let btn = $(this);
+               btn.prop('disabled', true);
                let xhr = new XMLHttpRequest();
                xhr.open("POST", "{$ltp_init_url nofilter}", true);
                xhr.setRequestHeader('Content-Type', 'application/json');
@@ -86,11 +88,13 @@
                    if (data.success) {
                        window.location.href = data.payment_url;
                    } else {
+                       btn.prop('disabled', false);
                        let errorMessage = "{l s='Failed to generate the LinkToPay, gateway response: ' mod='pg_prestashop_plugin'}";
                        window.alert(errorMessage + (data.error || ''));
                    }
                };
                xhr.onerror = function() {
+                   btn.prop('disabled', false);
                    window.alert('{l s='Error communicating with LinkToPay gateway.' mod='pg_prestashop_plugin'}');
                };
            });
@@ -99,21 +103,27 @@
 
     <script id="payment_checkout" type="text/javascript">
         jQuery(document).ready(function ($) {
+        let cardBtn = $('.js-payment-checkout');
             let paymentCheckout = new PaymentCheckout.modal({
                 locale: "{$checkout_language}",
                 env_mode: "{$environment}",
                 onOpen: function () {},
-                onClose: function () {},
+                onClose: function () {
+                    cardBtn.prop('disabled', false);
+                },
                 onResponse: function (response) {
                     if (response.transaction["status_detail"] === 3 || response.transaction["status_detail"] === 0) {
                         redirectCardPost(response);
                     } else {
+                        cardBtn.prop('disabled', false);
                         window.alert('{l s='An error occurred while processing your payment and could not be made. Try another Credit Card.' mod='pg_prestashop_plugin'}');
                     }
                 }
             });
 
             $('.js-payment-checkout').on('click', function () {
+                let btn = $(this);
+                btn.prop('disabled', true);
                 let xhr = new XMLHttpRequest();
                 xhr.open("POST", "{$card_init_url nofilter}", true);
                 xhr.setRequestHeader('Content-Type', 'application/json');
@@ -125,10 +135,12 @@
                             reference: data.reference
                         });
                     } else {
+                        btn.prop('disabled', false);
                         window.alert('{l s='Failed to get checkout reference, please try again.' mod='pg_prestashop_plugin'}');
                     }
                 };
                 xhr.onerror = function() {
+                    btn.prop('disabled', false);
                     window.alert('{l s='Error communicating with payment gateway.' mod='pg_prestashop_plugin'}');
                 };
             });

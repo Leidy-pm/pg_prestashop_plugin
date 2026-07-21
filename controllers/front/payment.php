@@ -40,8 +40,8 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
         $this->context->smarty->assign([
             'checkout_language' => $checkout_language,
             'environment'       => $environment,
-            'card_init_url'     => $this->context->link->getModuleLink($this->module->name, 'payment', ['action' => 'initCardReference', 'pg_sig' => $pg_sig]),
-            'ltp_init_url'      => $this->context->link->getModuleLink($this->module->name, 'ltp', ['pg_sig' => $pg_sig]),
+            'card_init_url'     => $this->context->link->getModuleLink($this->module->name, 'payment', ['action' => 'initCardReference', 'pg_sig' => $pg_sig], true),
+            'ltp_init_url'      => $this->context->link->getModuleLink($this->module->name, 'ltp', ['pg_sig' => $pg_sig], true),
             'pg_sig'            => $pg_sig,
             'products'          => $products,
             'card_button_text'  => Configuration::get('card_button_text'),
@@ -96,7 +96,8 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
             }
 
             $amountTaxData = PG_Prestashop_Utils::getCartAmountAndVat($cart);
-            $total        = (float) $amountTaxData['total'];
+            $cartTotal    = (float) $amountTaxData['total'];
+            $paymentAmount = (float) Tools::getValue('amount');
             $payment_id   = Tools::getValue('id');
             $status_detail = (int)Tools::getValue('status_detail');
 
@@ -104,10 +105,26 @@ class PG_Prestashop_PluginPaymentModuleFrontController extends ModuleFrontContro
                 throw new Exception('Missing payment id');
             }
 
+            // Only process approved (3) or pending (0) statuses; anything else is a failed payment.
+            // Do NOT call validateOrder for failed payments — the cart must remain intact.
+            if (!in_array($status_detail, [0, 3], true)) {
+                $this->errors[] = $this->module->l('Payment was not approved. Please try again.', 'payment');
+                $this->redirectWithNotifications($this->context->link->getPageLink('checkout'));
+                return;
+            }
+
+            if ($paymentAmount <= 0) {
+                throw new Exception('Missing payment amount');
+            }
+
+            if (abs($paymentAmount - $cartTotal) > 0.01) {
+                throw new Exception('Payment amount mismatch');
+            }
+
             $this->module->validateOrder(
                 $cart->id,
                 Configuration::get('PS_OS_PREPARATION'),
-                $total,
+                $paymentAmount,
                 $this->module->displayName,
                 null,
                 [],
