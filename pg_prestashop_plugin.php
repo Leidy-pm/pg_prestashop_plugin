@@ -9,6 +9,7 @@ include_once(_PS_MODULE_DIR_.'pg_prestashop_plugin/classes/WebserviceSpecificMan
 const FLAVOR = 'Paymentez';
 const FLAVOR_DOMAIN = 'paymentez.com';
 const REFUND_PATH = '/v2/transaction/refund/';
+const REFUND_GUARD_TABLE = 'paymentez_refund_guard';
 const WEBHOOK_RESOURCE_NAME = 'paymentezwebhook';
 const WEBHOOK_WS_CONFIG_KEY = 'PG_PRESTASHOP_PLUGIN_WEBHOOK_WS_KEY';
 
@@ -25,6 +26,8 @@ const WEBHOOK_WS_CONFIG_KEY = 'PG_PRESTASHOP_PLUGIN_WEBHOOK_WS_KEY';
  */
 class PG_Prestashop_Plugin extends PaymentModule
 {
+    private static bool $refundRequestHandled = false;
+
     public function __construct()
     {
         $this->name                   = 'pg_prestashop_plugin';
@@ -53,12 +56,13 @@ class PG_Prestashop_Plugin extends PaymentModule
             && $this->registerHook('displayBackOfficeHeader')
             && $this->registerHook('paymentOptions')
             && $this->registerHook('addWebserviceResources')
-            && $this->installWebhookWebservice();
+            && $this->installRefundGuardTable() && $this->installWebhookWebservice();
     }
 
     public function uninstall(): bool
     {
-        return $this->uninstallWebhookWebservice() && parent::uninstall();
+        return $this->uninstallRefundGuardTable()
+            && $this->uninstallWebhookWebservice() && parent::uninstall();
     }
 
     public function syncWebhookWebservice(): bool
@@ -438,21 +442,11 @@ class PG_Prestashop_Plugin extends PaymentModule
 
     private function processRefundRequest(array $params): void
     {
-        $hasLegacyCancelProduct = !empty($_POST['cancel_product']);
-        $hasOrderSlipData = isset($params['orderSlipCreated'])
-            || isset($params['productList'])
-            || isset($params['order_slip']);
-        $isPerProductCall = isset($params['id_order_detail'])
-            || isset($params['cancel_amount'])
-            || isset($params['cancel_quantity']);
-
-        if ($isPerProductCall && !$hasLegacyCancelProduct && !$hasOrderSlipData) {
+        if (self::$refundRequestHandled) {
             return;
         }
 
-        if (!$hasLegacyCancelProduct
-            && !$hasOrderSlipData
-            && (int)($params['action'] ?? 1) !== 1) {
+        if ((int) ($params['action'] ?? 1) !== 1 && empty($_POST['cancel_product'])) {
             return;
         }
 
@@ -467,11 +461,11 @@ class PG_Prestashop_Plugin extends PaymentModule
         }
 
         $amount_to_refund = $this->resolveRefundAmount($params, $order);
-
         if ($amount_to_refund <= 0) {
             PrestaShopLogger::addLog('Paymentez refund skipped: refund amount is zero.', 3);
             return;
         }
+        $amount_to_refund = $this->normalizeRefundAmount($amount_to_refund);
 
         $transaction_id = $this->getOrderTransactionId($order);
         if ($transaction_id === '') {
@@ -479,12 +473,33 @@ class PG_Prestashop_Plugin extends PaymentModule
             return;
         }
 
-        $response = $this->sendRefundToPaymentez($transaction_id, $amount_to_refund);
-        if ($response === null) {
+        // Capture the current state before processing so we can revert if the gateway fails.
+        // PrestaShop may change the order state itself (e.g. when creating an OrderSlip) before
+        // our hook runs, so we must be ready to roll it back.
+        $previous_order_state = (int) $order->current_state;
+
+        $refund_guard_key = $this->buildRefundGuardKey($params, $order, $transaction_id, $amount_to_refund);
+        if (!$this->reserveRefundRequest($refund_guard_key, $order, $transaction_id, $amount_to_refund)) {
+            PrestaShopLogger::addLog('Paymentez refund skipped: duplicate refund request detected.', 3);
             return;
         }
 
-        $history           = new OrderHistory();
+        self::$refundRequestHandled = true;
+        PrestaShopLogger::addLog(
+            'Paymentez refund amount sent to gateway: ' . number_format($amount_to_refund, 2, '.', ''),
+            1
+        );
+
+        $response = $this->sendRefundToPaymentez($transaction_id, $amount_to_refund);
+        if ($response === null) {
+            $this->releaseRefundRequest($refund_guard_key);
+            $this->rollbackFailedRefund($params, $order, $previous_order_state);
+            return;
+        }
+
+        $this->markRefundRequestProcessed($refund_guard_key, $response);
+
+        $history = new OrderHistory();
         $history->id_order = (int) $order->id;
         $history->changeIdOrderState($this->getRefundOrderStateId(), (int) $order->id);
         $history->save();
@@ -520,62 +535,7 @@ class PG_Prestashop_Plugin extends PaymentModule
             return $this->calculateRefundAmount($cancel_product, $order);
         }
 
-        if (isset($params['orderSlipCreated']) && $params['orderSlipCreated'] instanceof OrderSlip) {
-            $amount = $this->extractAmountFromOrderSlip($params['orderSlipCreated']);
-            if ($amount > 0) {
-                return $amount;
-            }
-        }
-
-        if (isset($params['order_slip']) && $params['order_slip'] instanceof OrderSlip) {
-            $amount = $this->extractAmountFromOrderSlip($params['order_slip']);
-            if ($amount > 0) {
-                return $amount;
-            }
-        }
-
-        if (!empty($params['productList']) && is_array($params['productList'])) {
-            $amount = 0.0;
-            foreach ($params['productList'] as $product) {
-                if (!is_array($product)) {
-                    continue;
-                }
-
-                if (isset($product['amount']) && is_numeric($product['amount'])) {
-                    $amount += (float) $product['amount'];
-                    continue;
-                }
-
-                if (isset($product['total_refunded_tax_incl']) && is_numeric($product['total_refunded_tax_incl'])) {
-                    $amount += (float) $product['total_refunded_tax_incl'];
-                    continue;
-                }
-
-                $unitPrice = (float) ($product['unit_price_tax_incl'] ?? $product['price_wt'] ?? $product['price'] ?? 0);
-                $quantity = (float) ($product['quantity'] ?? $product['refund_quantity'] ?? 0);
-                $amount += $unitPrice * $quantity;
-            }
-
-            if ($amount > 0) {
-                return round($amount, 2);
-            }
-        }
-
-        foreach (['amount_to_refund', 'refund_amount', 'cancel_amount', 'amount', 'total'] as $key) {
-            if (isset($params[$key]) && is_numeric($params[$key])) {
-                return (float) $params[$key];
-            }
-        }
-
-        $latestSlip = $this->loadLatestOrderSlip($order);
-        if ($latestSlip instanceof OrderSlip) {
-            $amount = $this->extractAmountFromOrderSlip($latestSlip);
-            if ($amount > 0) {
-                return $amount;
-            }
-        }
-
-        return 0.0;
+        return $this->resolveOrderSlipAmount($params);
     }
 
     private function extractAmountFromOrderSlip(OrderSlip $slip): float
@@ -589,20 +549,259 @@ class PG_Prestashop_Plugin extends PaymentModule
         return $amount > 0 ? round($amount, 2) : 0.0;
     }
 
-    private function loadLatestOrderSlip(Order $order): ?OrderSlip
+    private function normalizeRefundAmount(float $amount): float
     {
-        $id = (int) Db::getInstance()->getValue(
-            'SELECT id_order_slip FROM `' . _DB_PREFIX_ . 'order_slip`
-             WHERE id_order = ' . (int) $order->id . '
-             ORDER BY id_order_slip DESC'
-        );
+        return round(max(0.0, $amount), 2, PHP_ROUND_HALF_DOWN);
+    }
 
-        if ($id <= 0) {
-            return null;
+    private function buildRefundGuardKey(array $params, Order $order, string $transaction_id, float $amount_to_refund): string
+    {
+        $orderSlipId = $this->resolveOrderSlipId($params);
+        if ($orderSlipId > 0) {
+            return 'order-slip:' . $orderSlipId;
         }
 
-        $slip = new OrderSlip($id);
-        return Validate::isLoadedObject($slip) ? $slip : null;
+        $cancelProduct = (array) ($_POST['cancel_product'] ?? []);
+        $sourceSignature = $this->buildRefundSourceSignature($cancelProduct);
+
+        return hash(
+            'sha256',
+            implode('|', [
+                (string) $order->id,
+                (string) $order->reference,
+                $transaction_id,
+                number_format($amount_to_refund, 2, '.', ''),
+                $sourceSignature,
+            ])
+        );
+    }
+
+    private function buildRefundSourceSignature(array $cancel_product): string
+    {
+        if (empty($cancel_product)) {
+            return '';
+        }
+
+        $normalized = [];
+        foreach ($cancel_product as $key => $value) {
+            if ($key === '_token' || $key === 'save') {
+                continue;
+            }
+
+            if (strpos((string) $key, 'selected') === false && strpos((string) $key, 'quantity') === false && !in_array($key, ['shipping_amount', 'shipping', 'credit_slip', 'voucher_refund_type', 'voucher'], true)) {
+                continue;
+            }
+
+            $normalized[$key] = is_scalar($value) ? (string) $value : (json_encode($value) ?: '');
+        }
+
+        ksort($normalized);
+        return hash('sha256', json_encode($normalized) ?: '');
+    }
+
+    private function rollbackFailedRefund(array $params, Order $order, int $previous_order_state): void
+    {
+        // 1. Delete the OrderSlip that PrestaShop already created for this failed refund
+        $orderSlipId = $this->resolveOrderSlipId($params);
+        if ($orderSlipId > 0) {
+            $orderSlip = new OrderSlip($orderSlipId);
+            if (Validate::isLoadedObject($orderSlip) && (int) $orderSlip->id_order === (int) $order->id) {
+                Db::getInstance()->delete(
+                    'order_slip_detail',
+                    '`id_order_slip` = ' . (int) $orderSlipId
+                );
+                Db::getInstance()->delete(
+                    'order_slip_detail_tax',
+                    '`id_order_slip_detail` IN (SELECT id_order_slip_detail FROM `' . _DB_PREFIX_ . 'order_slip_detail` WHERE id_order_slip = ' . (int) $orderSlipId . ')'
+                );
+                $orderSlip->delete();
+                PrestaShopLogger::addLog(
+                    'Paymentez refund failed: deleted OrderSlip #' . $orderSlipId . ' for order #' . $order->id,
+                    3
+                );
+            }
+        }
+
+        // 2. Revert the order state if PrestaShop already changed it
+        $order = new Order((int) $order->id);
+        if ((int) $order->current_state !== $previous_order_state) {
+            $revert = new OrderHistory();
+            $revert->id_order = (int) $order->id;
+            $revert->changeIdOrderState($previous_order_state, (int) $order->id);
+            $revert->save();
+            PrestaShopLogger::addLog(
+                'Paymentez refund failed: order #' . $order->id . ' state reverted to ' . $previous_order_state,
+                3
+            );
+        }
+
+        // 3. Notify the admin user in the back office (both inline and via cookie for post-redirect display)
+        $this->notifyRefundFailure();
+    }
+
+    private function notifyRefundFailure(): void
+    {
+        $message = $this->l('Paymentez refund failed: the gateway rejected the refund request. The order was not refunded. Please check the logs and try again.');
+
+        // Inline error for current controller (works if PrestaShop renders the response now)
+        if (isset($this->context->controller) && is_object($this->context->controller)) {
+            if (property_exists($this->context->controller, 'errors') && is_array($this->context->controller->errors)) {
+                $this->context->controller->errors[] = $message;
+            }
+        }
+
+        // Cookie-based flash message (survives the redirect PrestaShop usually performs after a refund)
+        if (isset($this->context->cookie) && is_object($this->context->cookie)) {
+            $this->context->cookie->__set('paymentez_refund_error', $message);
+            $this->context->cookie->write();
+        }
+    }
+
+    private function resolveOrderSlipId(array $params): int
+    {
+        $idOrderSlip = (int) ($params['id_order_slip'] ?? 0);
+        if ($idOrderSlip > 0) {
+            return $idOrderSlip;
+        }
+
+        foreach (['order_slip', 'orderSlip'] as $key) {
+            if (!isset($params[$key]) || !is_object($params[$key])) {
+                continue;
+            }
+
+            $idOrderSlip = (int) ($params[$key]->id_order_slip ?? $params[$key]->id ?? 0);
+            if ($idOrderSlip > 0) {
+                return $idOrderSlip;
+            }
+        }
+
+        return 0;
+    }
+
+    private function reserveRefundRequest(string $refund_guard_key, Order $order, string $transaction_id, float $amount_to_refund): bool
+    {
+        $sql = 'INSERT IGNORE INTO `' . _DB_PREFIX_ . REFUND_GUARD_TABLE . '`
+            (`refund_key`, `id_order`, `transaction_id`, `amount`, `status`, `created_at`, `updated_at`)
+            VALUES (
+                "' . pSQL($refund_guard_key) . '",
+                ' . (int) $order->id . ',
+                "' . pSQL($transaction_id) . '",
+                ' . (float) $amount_to_refund . ',
+                "pending",
+                NOW(),
+                NOW()
+            )';
+
+        if (!Db::getInstance()->execute($sql)) {
+            return false;
+        }
+
+        return (int) Db::getInstance()->getValue('SELECT ROW_COUNT()') === 1;
+    }
+
+    private function markRefundRequestProcessed(string $refund_guard_key, array $response): bool
+    {
+        $sql = 'UPDATE `' . _DB_PREFIX_ . REFUND_GUARD_TABLE . '`
+            SET `status` = "processed",
+                `response_json` = "' . pSQL(json_encode($response, JSON_PRESERVE_ZERO_FRACTION) ?: '') . '",
+                `updated_at` = NOW()
+            WHERE `refund_key` = "' . pSQL($refund_guard_key) . '"';
+
+        return (bool) Db::getInstance()->execute($sql);
+    }
+
+    private function releaseRefundRequest(string $refund_guard_key): bool
+    {
+        $sql = 'DELETE FROM `' . _DB_PREFIX_ . REFUND_GUARD_TABLE . '`
+            WHERE `refund_key` = "' . pSQL($refund_guard_key) . '" AND `status` = "pending"';
+
+        return (bool) Db::getInstance()->execute($sql);
+    }
+
+    private function resolveOrderSlipAmount(array $params): float
+    {
+        $amount = $this->extractRefundAmountFromSource($params['order_slip'] ?? null);
+        if ($amount > 0) {
+            PrestaShopLogger::addLog('Paymentez debug: amount from params[order_slip] = ' . $amount, 1);
+            return $amount;
+        }
+
+        $amount = $this->extractRefundAmountFromSource($params['orderSlip'] ?? null);
+        if ($amount > 0) {
+            PrestaShopLogger::addLog('Paymentez debug: amount from params[orderSlip] = ' . $amount, 1);
+            return $amount;
+        }
+
+        $idOrderSlip = (int) (
+            $params['id_order_slip']
+            ?? $params['order_slip']->id_order_slip
+            ?? $params['order_slip']->id
+            ?? $params['orderSlip']->id_order_slip
+            ?? $params['orderSlip']->id
+            ?? 0
+        );
+
+        PrestaShopLogger::addLog('Paymentez debug: trying to load OrderSlip with id = ' . $idOrderSlip, 1);
+
+        if ($idOrderSlip <= 0) {
+            return 0.0;
+        }
+
+        $orderSlip = new OrderSlip($idOrderSlip);
+        if (!Validate::isLoadedObject($orderSlip)) {
+            PrestaShopLogger::addLog('Paymentez debug: OrderSlip ' . $idOrderSlip . ' failed to load', 1);
+            return 0.0;
+        }
+
+        PrestaShopLogger::addLog('Paymentez debug: OrderSlip loaded, extracting amount from object', 1);
+        PrestaShopLogger::addLog('Paymentez debug: OrderSlip data = ' . json_encode(get_object_vars($orderSlip)), 1);
+
+        $amount = $this->extractRefundAmountFromSource($orderSlip);
+        if ($amount > 0) {
+            PrestaShopLogger::addLog('Paymentez debug: amount from OrderSlip object = ' . $amount, 1);
+        }
+
+        return $amount;
+    }
+
+    private function extractRefundAmountFromSource($source): float
+    {
+        if ($source === null) {
+            return 0.0;
+        }
+
+        if (is_numeric($source)) {
+            return (float) $source;
+        }
+
+        if (!is_object($source) && !is_array($source)) {
+            return 0.0;
+        }
+
+        if ($source instanceof OrderSlip) {
+            return $this->extractAmountFromOrderSlip($source);
+        }
+
+        // Handle array or generic object with amount fields
+        $amount = 0.0;
+        $fields = is_object($source) ? get_object_vars($source) : $source;
+
+        if (is_array($fields)) {
+            if (isset($fields['amount']) && is_numeric($fields['amount'])) {
+                $amount += (float) $fields['amount'];
+            }
+            if (isset($fields['shipping_cost_amount']) && is_numeric($fields['shipping_cost_amount'])) {
+                $amount += (float) $fields['shipping_cost_amount'];
+            }
+            if (isset($fields['total_products_tax_incl']) && is_numeric($fields['total_products_tax_incl'])) {
+                $amount += (float) $fields['total_products_tax_incl'];
+            }
+            if (isset($fields['total_shipping_tax_incl']) && is_numeric($fields['total_shipping_tax_incl'])) {
+                $amount += (float) $fields['total_shipping_tax_incl'];
+            }
+        }
+
+        return round(max(0.0, $amount), 2);
     }
 
     private function sendRefundToPaymentez(string $transaction_id, float $amount_to_refund): ?array
@@ -613,17 +812,20 @@ class PG_Prestashop_Plugin extends PaymentModule
             : 'https://ccapi.' . FLAVOR_DOMAIN . REFUND_PATH;
 
         $app_code_server = Configuration::get('app_code_server');
-        $app_key_server  = Configuration::get('app_key_server');
+        $app_key_server = Configuration::get('app_key_server');
         $refund_data = [
             'transaction' => ['id' => $transaction_id],
-            'order' => ['amount' => round($amount_to_refund, 2, PHP_ROUND_HALF_DOWN)]
+            'order' => ['amount' => $this->normalizeRefundAmount($amount_to_refund)],
         ];
-        $payload = json_encode($refund_data);
+        $payload = json_encode($refund_data, JSON_PRESERVE_ZERO_FRACTION);
+        if ($payload === false) {
+            PrestaShopLogger::addLog('Paymentez refund payload encoding failed.', 3);
+            return null;
+        }
 
-        $timestamp         = (string) time();
-        $uniq_token_string = $app_key_server . $timestamp;
-        $uniq_token_hash   = hash('sha256', $uniq_token_string);
-        $auth_token        = base64_encode($app_code_server . ';' . $timestamp . ';' . $uniq_token_hash);
+        $timestamp = (string) time();
+        $uniq_token_hash = hash('sha256', $app_key_server . $timestamp);
+        $auth_token = base64_encode($app_code_server . ';' . $timestamp . ';' . $uniq_token_hash);
 
         $ch = curl_init($url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -633,7 +835,7 @@ class PG_Prestashop_Plugin extends PaymentModule
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
             'Content-Type:application/json',
-            'Auth-Token:' . $auth_token
+            'Auth-Token:' . $auth_token,
         ]);
         $response = curl_exec($ch);
         $curl_error = curl_error($ch);
@@ -655,45 +857,79 @@ class PG_Prestashop_Plugin extends PaymentModule
 
     private function calculateRefundAmount(array $cancel_product, Order $order): float
     {
-        if ($this->isFullRefundRequest($cancel_product)) {
-            return (float) $order->total_paid;
+        $amount_to_refund = 0.0;
+
+        $shipping_amount = $this->extractShippingRefundAmount($cancel_product, $order);
+        if ($shipping_amount > 0) {
+            $amount_to_refund += $shipping_amount;
+            PrestaShopLogger::addLog('Paymentez debug: shipping_amount = ' . $shipping_amount, 1);
         }
 
-        $amount_to_refund = 0;
-        if (isset($cancel_product['shipping'])) {
-            $amount_to_refund += (float) $order->total_shipping;
-        }
-
-        $keys_pop = ['_token', 'save', 'voucher_refund_type', 'voucher', 'credit_slip', 'shipping_amount', 'shipping'];
-        foreach ($keys_pop as $key) {
+        // PrestaShop sends amounts directly as amount_X where X is order_detail_id
+        $keys_to_clean = ['_token', 'save', 'voucher_refund_type', 'voucher', 'credit_slip', 'shipping_amount', 'shipping', 'restock'];
+        foreach ($keys_to_clean as $key) {
             unset($cancel_product[$key]);
         }
 
-        $selected = [];
-        $quantity = [];
-        foreach (array_keys($cancel_product) as $key) {
-            if (strpos($key, 'selected') !== false) {
-                $id_order_detail = (string) explode('_', $key)[1];
-                $selected[$id_order_detail] = $cancel_product[$key];
-            } elseif (strpos($key, 'quantity') !== false) {
-                $id_order_detail = (string) explode('_', $key)[1];
-                $quantity[$id_order_detail] = $cancel_product[$key];
+        // Sum all amount_X values (PrestaShop pre-calculates these)
+        foreach ($cancel_product as $key => $value) {
+            if (strpos($key, 'amount_') === 0) {
+                $refund_amount = (float) $value;
+                if ($refund_amount > 0) {
+                    $order_detail_id = str_replace('amount_', '', $key);
+                    PrestaShopLogger::addLog('Paymentez debug: order_detail_id=' . $order_detail_id . ', amount=' . $refund_amount, 1);
+                    $amount_to_refund += $refund_amount;
+                }
             }
         }
 
-        foreach ($selected as $key => $value) {
-            if ($value) {
-                $order_detail = new OrderDetail((int) $key);
-                $amount_to_refund += ((float) ($quantity[$key] ?? 0)) * (float) $order_detail->unit_price_tax_incl;
+        // Fallback to old format (selected_X + quantity_X) for backward compatibility
+        if ($amount_to_refund == 0) {
+            $selected = [];
+            $quantity = [];
+            foreach (array_keys($cancel_product) as $key) {
+                if (strpos($key, 'selected') !== false) {
+                    $id_order_detail = (string) explode('_', $key)[1];
+                    $selected[$id_order_detail] = $cancel_product[$key];
+                } elseif (strpos($key, 'quantity') !== false) {
+                    $id_order_detail = (string) explode('_', $key)[1];
+                    $quantity[$id_order_detail] = $cancel_product[$key];
+                }
+            }
+
+            PrestaShopLogger::addLog('Paymentez debug: selected = ' . json_encode($selected), 1);
+            PrestaShopLogger::addLog('Paymentez debug: quantity = ' . json_encode($quantity), 1);
+
+            foreach ($selected as $key => $value) {
+                if ($value) {
+                    $order_detail = new OrderDetail((int) $key);
+                    $qty = (float) ($quantity[$key] ?? 0);
+                    $unit_price = (float) $order_detail->unit_price_tax_incl;
+                    $product_amount = $qty * $unit_price;
+                    PrestaShopLogger::addLog('Paymentez debug: order_detail_id=' . $key . ', qty=' . $qty . ', unit_price=' . $unit_price . ', product_amount=' . $product_amount, 1);
+                    $amount_to_refund += $product_amount;
+                }
             }
         }
 
+        PrestaShopLogger::addLog('Paymentez debug: calculateRefundAmount final = ' . $amount_to_refund, 1);
         return $amount_to_refund;
     }
 
-    private function isFullRefundRequest(array $cancel_product): bool
+    private function extractShippingRefundAmount(array $cancel_product, Order $order): float
     {
-        return !empty($cancel_product['credit_slip']) && (string) $cancel_product['credit_slip'] !== '0';
+        if (isset($cancel_product['shipping_amount']) && is_numeric($cancel_product['shipping_amount'])) {
+            $shipping_amount = (float) $cancel_product['shipping_amount'];
+            if ($shipping_amount > 0) {
+                return $shipping_amount;
+            }
+        }
+
+        if (!empty($cancel_product['shipping'])) {
+            return (float) $order->total_shipping;
+        }
+
+        return 0.0;
     }
 
     private function getOrderTransactionId(Order $order): string
@@ -791,6 +1027,35 @@ class PG_Prestashop_Plugin extends PaymentModule
                 'specific_management' => true
             )
         );
+    }
+
+    private function installRefundGuardTable(): bool
+    {
+       $sql = 'CREATE TABLE IF NOT EXISTS `' . _DB_PREFIX_ . REFUND_GUARD_TABLE . '` (
+           `id_refund_guard` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+           `refund_key` VARCHAR(128) NOT NULL,
+           `id_order` INT UNSIGNED NOT NULL,
+           `transaction_id` VARCHAR(128) NOT NULL,
+           `amount` DECIMAL(20,2) NOT NULL DEFAULT 0.00,
+           `status` VARCHAR(20) NOT NULL DEFAULT "pending",
+           `response_json` MEDIUMTEXT NULL,
+           `created_at` DATETIME NOT NULL,
+           `updated_at` DATETIME NOT NULL,
+           PRIMARY KEY (`id_refund_guard`),
+           UNIQUE KEY `refund_key_unique` (`refund_key`)
+       ) ENGINE=' . _MYSQL_ENGINE_ . ' DEFAULT CHARSET=utf8mb4';
+
+       if (!Db::getInstance()->execute($sql)) {
+           PrestaShopLogger::addLog('Paymentez could not create the refund guard table.', 3);
+           return false;
+       }
+
+       return true;
+    }
+
+    private function uninstallRefundGuardTable(): bool
+    {
+       return (bool) Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . REFUND_GUARD_TABLE . '`');
     }
 
     private function installWebhookWebservice(): bool
